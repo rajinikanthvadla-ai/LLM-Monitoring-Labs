@@ -1,0 +1,297 @@
+version: "3.9"
+
+# ============================================================
+# LLM Monitoring Lab - Full Stack
+#
+# Services:
+#   - Ollama            → Local LLM (llama3.2:1b, mistral)
+#   - Langfuse v3       → LLM Traces (OTLP for Python SDK v4), UI (port 3000)
+#   - Phoenix (Arize)   → Open-source LLM Tracing + Evals (port 6006)
+#   - Prometheus        → Metrics scraping (port 9090)
+#   - Grafana           → Dashboards (port 3001)
+#   - Pushgateway       → Accepts metrics pushed by batch/script apps (port 9091)
+#   - metrics-app       → Our load generator (exposes :8000 for Prometheus)
+# ============================================================
+
+services:
+
+  # ─────────────────────────────────────────────
+  # LOCAL LLM ENGINE
+  # ─────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: llm-monitoring-labs-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Pull models on startup
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_models:/root/.ollama
+    entrypoint: >
+      sh -c "
+        ollama pull llama3.2:1b &&
+        echo 'Models ready!'
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+
+  # ─────────────────────────────────────────────
+  # LANGFUSE v3 — Python SDK v4 sends OTLP to /api/public/otel/v1/traces (not in v2 image).
+  # First upgrade from the old v2 stack: docker compose down && docker volume rm ...langfuse_db
+  # ─────────────────────────────────────────────
+  langfuse-db:
+    image: postgres:15-alpine
+    container_name: langfuse-db
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - langfuse_db:/var/lib/postgresql/data
+
+  langfuse-redis:
+    image: redis:7
+    container_name: langfuse-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass labredis123
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "labredis123", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  langfuse-minio:
+    image: minio/minio:latest
+    container_name: langfuse-minio
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command: -c 'mkdir -p /data/langfuse && minio server /data --address ":9000" --console-address ":9001"'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: langfuse-clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://localhost:3000
+      DATABASE_URL: postgresql://postgres:postgres@langfuse-db:5432/postgres
+      SALT: superSecretSalt123
+      # Must be quoted — bare digits are parsed as YAML numbers and break Langfuse.
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: labredis123
+      REDIS_TLS_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+  langfuse:
+    image: langfuse/langfuse:3
+    container_name: langfuse
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-worker:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: superSecretNextAuth123
+      LANGFUSE_INIT_ORG_ID: lab-org
+      LANGFUSE_INIT_ORG_NAME: "LLM Lab Org"
+      LANGFUSE_INIT_PROJECT_ID: lab-project
+      LANGFUSE_INIT_PROJECT_NAME: "LLM Monitoring Lab"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-labpublickey1234
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-labsecretkey1234
+      LANGFUSE_INIT_USER_EMAIL: admin@lab.local
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: admin123
+
+  # ─────────────────────────────────────────────
+  # PHOENIX (Arize) — Open-source LLM Tracing
+  # OpenTelemetry-native, great for RAG + agents
+  # ─────────────────────────────────────────────
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: phoenix
+    restart: unless-stopped
+    ports:
+      - "6006:6006"    # Web UI
+      - "4317:4317"    # OTLP gRPC ingress
+      - "4318:4318"    # legacy / optional; OTLP HTTP for Phoenix is on 6006
+    volumes:
+      - phoenix_data:/root/.phoenix
+    environment:
+      - PHOENIX_WORKING_DIR=/root/.phoenix
+
+  # ─────────────────────────────────────────────
+  # PROMETHEUS — Metrics collection
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+
+  # Pushgateway — for batch/script apps to push metrics
+  pushgateway:
+    image: prom/pushgateway:latest
+    container_name: pushgateway
+    restart: unless-stopped
+    ports:
+      - "9091:9091"
+
+  # ─────────────────────────────────────────────
+  # GRAFANA — Dashboards
+  # ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/llm-monitoring.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  # ─────────────────────────────────────────────
+  # METRICS APP — Load generator + Prometheus exporter
+  # Continuously simulates LLM traffic, exposes :8000
+  # ─────────────────────────────────────────────
+  metrics-app:
+    build:
+      context: ./apps
+      dockerfile: Dockerfile
+    container_name: metrics-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      LANGFUSE_PUBLIC_KEY: pk-lf-labpublickey1234
+      LANGFUSE_SECRET_KEY: sk-lf-labsecretkey1234
+      LANGFUSE_HOST: http://langfuse:3000
+      PHOENIX_OTLP_PROTOCOL: grpc
+      PHOENIX_OTLP_GRPC_ENDPOINT: http://phoenix:4317
+      PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006
+      DEFAULT_MODEL: llama3.2:1b
+      METRICS_PORT: "8000"
+    command: ["python", "load_generator.py"]
+
+volumes:
+  ollama_models:
+  langfuse_db:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  phoenix_data:
+  prometheus_data:
+  grafana_data:
